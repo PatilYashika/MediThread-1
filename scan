@@ -1,0 +1,286 @@
+
+from pathlib import Path
+
+import cv2
+import matplotlib.pyplot as plt
+import numpy as np
+import SimpleITK as sitk
+
+from scipy import ndimage as ndi
+
+
+# ---------------- USER CONFIGURATION ----------------
+DICOM_DIR = Path("dicom_series")
+OUTPUT_DIR = Path("segmentation_output")
+
+# Choose "bright" or "dark" based on known image appearance.
+CANDIDATE_MODE = "bright"
+
+# Percentile of intensities used as a candidate threshold.
+# Adjust only after inspecting representative scans.
+THRESHOLD_PERCENTILE = 97.0
+
+# Component size limits in voxels, not physical volume.
+MIN_COMPONENT_VOXELS = 20
+MAX_COMPONENT_FRACTION = 0.15
+
+# Number of slices to preview. None means preview all.
+PREVIEW_SLICES = 6
+# ----------------------------------------------------
+
+
+def load_dicom_volume(folder):
+    """Load one selected DICOM series as a 3D volume."""
+    series_ids = sitk.ImageSeriesReader.GetGDCMSeriesIDs(
+        str(folder)
+    )
+
+    if not series_ids:
+        raise RuntimeError(
+            f"No DICOM series found in: {folder}"
+        )
+
+    print("Available DICOM series:")
+    for idx, series_id in enumerate(series_ids):
+        print(f"  [{idx}] {series_id}")
+
+    # Explicitly choose a series instead of silently mixing series.
+    selected_index = 0
+    series_id = series_ids[selected_index]
+
+    file_names = (
+        sitk.ImageSeriesReader.GetGDCMSeriesFileNames(
+            str(folder), series_id
+        )
+    )
+
+    reader = sitk.ImageSeriesReader()
+    reader.SetFileNames(file_names)
+    volume_image = reader.Execute()
+
+    # Array convention: [slice, row, column].
+    volume = sitk.GetArrayFromImage(volume_image).astype(
+        np.float32
+    )
+
+    if volume.ndim != 3 or volume.shape[0] < 1:
+        raise ValueError("Expected a 3D DICOM image series.")
+
+    print("Volume shape [z, y, x]:", volume.shape)
+    print("Voxel spacing [x, y, z]:",
+          volume_image.GetSpacing())
+    print("Image modality:",
+          volume_image.GetMetaData("0008|0060")
+          if volume_image.HasMetaDataKey("0008|0060")
+          else "Not available")
+
+    return volume, volume_image
+
+
+def preprocess_volume(volume):
+    """Denoise each slice and enhance its local contrast."""
+    processed = np.zeros_like(volume, dtype=np.float32)
+
+    for z in range(volume.shape[0]):
+        sl = volume[z]
+
+        # Robustly scale this slice for 8-bit image processing.
+        lo, hi = np.percentile(sl, [1, 99])
+
+        if hi <= lo:
+            processed[z] = sl
+            continue
+
+        scaled = np.clip(
+            (sl - lo) * 255.0 / (hi - lo),
+            0, 255
+        ).astype(np.uint8)
+
+        # Median filter reduces isolated impulse-like noise.
+        denoised = cv2.medianBlur(scaled, 3)
+
+        # CLAHE enhances local contrast.
+        clahe = cv2.createCLAHE(
+            clipLimit=2.0,
+            tileGridSize=(8, 8)
+        )
+        enhanced = clahe.apply(denoised)
+
+        processed[z] = enhanced.astype(np.float32)
+
+    return processed
+
+
+def segment_candidates(processed):
+    """Create a 3D mask of intensity-based candidates."""
+    if CANDIDATE_MODE not in {"bright", "dark"}:
+        raise ValueError(
+            "CANDIDATE_MODE must be 'bright' or 'dark'."
+        )
+
+    # Use a single global threshold for consistency across slices.
+    # This assumes the preprocessed intensities are comparable.
+    threshold = np.percentile(
+        processed, THRESHOLD_PERCENTILE
+    )
+
+    if CANDIDATE_MODE == "bright":
+        mask = processed >= threshold
+    else:
+        threshold = np.percentile(
+            processed, 100.0 - THRESHOLD_PERCENTILE
+        )
+        mask = processed <= threshold
+
+    mask = mask.astype(bool)
+
+    # Remove isolated noise and close small gaps in 3D.
+    structure = ndi.generate_binary_structure(3, 1)
+
+    mask = ndi.binary_opening(
+        mask, structure=structure, iterations=1
+    )
+    mask = ndi.binary_closing(
+        mask, structure=structure, iterations=1
+    )
+
+    # Label 3D connected components.
+    labels, number = ndi.label(mask, structure=structure)
+    sizes = np.bincount(labels.ravel())
+
+    max_voxels = int(
+        mask.size * MAX_COMPONENT_FRACTION
+    )
+
+    cleaned = np.zeros_like(mask, dtype=bool)
+    component_info = []
+
+    for label_id in range(1, number + 1):
+        size = int(sizes[label_id])
+
+        if (
+            size < MIN_COMPONENT_VOXELS
+            or size > max_voxels
+        ):
+            continue
+
+        component = labels == label_id
+        cleaned |= component
+
+        coords = np.argwhere(component)
+        centroid_zyx = coords.mean(axis=0)
+
+        component_info.append({
+            "label": label_id,
+            "voxels": size,
+            "centroid_zyx": np.round(
+                centroid_zyx, 2
+            ).tolist()
+        })
+
+    print("Intensity threshold:", threshold)
+    print("Candidate components retained:",
+          len(component_info))
+
+    for item in component_info:
+        print(item)
+
+    return cleaned, component_info
+
+
+def save_results(mask, volume, reference_image):
+    """Save mask volume and per-slice visualization."""
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    mask_image = sitk.GetImageFromArray(
+        mask.astype(np.uint8)
+    )
+    mask_image.CopyInformation(reference_image)
+
+    sitk.WriteImage(
+        mask_image,
+        str(OUTPUT_DIR / "candidate_mask.nii.gz")
+    )
+
+    # Save a preview of selected slices.
+    n_slices = volume.shape[0]
+
+    if PREVIEW_SLICES is None:
+        indices = range(n_slices)
+    else:
+        count = min(PREVIEW_SLICES, n_slices)
+        indices = np.linspace(
+            0, n_slices - 1, count, dtype=int
+        )
+
+    for z in indices:
+        original = volume[z]
+        lo, hi = np.percentile(original, [1, 99])
+
+        gray = np.clip(
+            (original - lo) * 255.0 / max(hi - lo, 1e-6),
+            0, 255
+        ).astype(np.uint8)
+
+        rgb = cv2.cvtColor(
+            gray, cv2.COLOR_GRAY2RGB
+        )
+
+        overlay = rgb.copy()
+        overlay[mask[z]] = [255, 0, 0]
+
+        result = cv2.addWeighted(
+            rgb, 0.65, overlay, 0.35, 0
+        )
+
+        contours, _ = cv2.findContours(
+            mask[z].astype(np.uint8),
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+        cv2.drawContours(
+            result, contours, -1, (255, 255, 0), 1
+        )
+
+        cv2.imwrite(
+            str(OUTPUT_DIR / f"slice_{z:04d}.png"),
+            cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
+        )
+
+    print("Results saved to:", OUTPUT_DIR.resolve())
+
+
+def main():
+    volume, reference_image = load_dicom_volume(DICOM_DIR)
+
+    processed = preprocess_volume(volume)
+    mask, components = segment_candidates(processed)
+
+    save_results(mask, volume, reference_image)
+
+    # Show the middle slice for quick inspection.
+    z = volume.shape[0] // 2
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    axes[0].imshow(volume[z], cmap="gray")
+    axes[0].set_title("Original slice")
+
+    axes[1].imshow(processed[z], cmap="gray")
+    axes[1].set_title("Denoised and enhanced")
+
+    axes[2].imshow(volume[z], cmap="gray")
+    axes[2].imshow(
+        mask[z], cmap="Reds", alpha=0.45,
+        vmin=0, vmax=1
+    )
+    axes[2].set_title("Candidate overlay")
+
+    for ax in axes:
+        ax.axis("off")
+
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
